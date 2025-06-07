@@ -3,4 +3,5 @@ langchain-openai
 langchain_core
 python-dotenv
 langchain_community
-chromadb
+langchain_chroma
+pypdf
