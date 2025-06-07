@@ -1,84 +1,122 @@
-import streamlit as st
-from langchain_openai import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain_community.document_loaders import TextLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain  
-
 import os
+import streamlit as st
 from dotenv import load_dotenv
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain.chains.history_aware_retriever import create_history_aware_retriever
+from langchain.chains.retrieval import create_retrieval_chain
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+# Load environment variables
 load_dotenv()
-
-
-#langsmith tracing
-os.environ["LANGCHAIN_API_KEY"]=os.getenv("LANGCHAIN_API")
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API")
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_PROJECT"]="ChatBot with OpenAI"
+os.environ["LANGCHAIN_PROJECT"] = "ChatBot with OpenAI"
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API")
 
-#openai API key
-os.environ["OPENAI_API_KEY"]=os.getenv("OPENAI_API")
-
-#LLM model
+# Initialize LLM and Embeddings
 llm = ChatOpenAI(model="gpt-4")
+embeddings = OpenAIEmbeddings()
 
-#Conversational memory
-memory = ConversationBufferMemory(memory_key="chat_history",return_messages=True)
+# Streamlit UI setup
+st.set_page_config(page_title="PDF RAG Chatbot", layout="wide")
+st.title("Conversational RAG with PDF & Chat History")
+st.markdown("Upload PDF files and chat with their content using Retrieval-Augmented Generation.")
 
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
+# Session state setup for chat history and vector store
+if "store" not in st.session_state:
+    st.session_state.store = {}
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-#streamlit UI setup
-st.set_page_config(page_title="Chatbot with RAG support", layout="wide")
-st.title("ChatBot")
-uploaded_file = st.file_uploader("Upload a .txt file", type=["txt"])
+# Use a fixed session key internally (no user input)
+SESSION_KEY = "default_session"
 
-if uploaded_file:
-    if os.path.exists("temp_txt"):
-        os.remove("temp_txt")
+# PDF Upload
+uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
 
-    with open("temp_txt","wb") as file:
-        file.write(uploaded_file.getbuffer())
+if uploaded_files:
+    documents = []
 
-    loader = TextLoader("temp_txt")
-    docs = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=100,chunk_overlap=50)
-    split_docs = text_splitter.split_documents(docs)
-    embeddings = OpenAIEmbeddings()
-    st.session_state.vectorstore = Chroma.from_documents(split_docs,embeddings)
-    st.success("File uploaded")
+    for uploaded_file in uploaded_files:
+        temp_path = f"./{uploaded_file.name}"
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        with open(temp_path, "wb") as file:
+            file.write(uploaded_file.getvalue())
 
+        loader = PyPDFLoader(temp_path)
+        docs = loader.load()
+        documents.extend(docs)
 
-#Handle user input
-user_input = st.chat_input("Ask me anything!")
+    # Split and embed documents
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=500)
+    splits = text_splitter.split_documents(documents)
+    vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+    retriever = vectorstore.as_retriever()
 
-if user_input:
-    st.chat_message("user").write(user_input)
+    # Contextualize prompt for history-aware retriever
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Given a chat history and the latest user question "
+                   "which might reference context in the chat history, "
+                   "formulate a standalone question which can be understood "
+                   "without the chat history. Do NOT answer the question, "
+                   "just reformulate it if needed and otherwise return it as is."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
 
-    if st.session_state.vectorstore:
-        retriever = st.session_state.vectorstore.as_retriever()
-        qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=retriever,
-            memory=memory
+    # Answer generation prompt
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an assistant for question-answering tasks. "
+                   "Use the following pieces of retrieved context to answer "
+                   "the question. If you don't know the answer, say that you "
+                   "don't know. Use three sentences maximum and keep the "
+                   "answer concise.\n\n{context}"),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+    # Define message store getter
+    def get_session_history(session: str) -> BaseChatMessageHistory:
+        if session not in st.session_state.store:
+            st.session_state.store[session] = ChatMessageHistory()
+        return st.session_state.store[session]
+
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer"
+    )
+
+    # Chat Input
+    user_input = st.text_input("Your Question:")
+    if user_input:
+        session_history = get_session_history(SESSION_KEY)
+        response = conversational_rag_chain.invoke(
+            {"input": user_input},
+            config={"configurable": {"session_id": SESSION_KEY}}
         )
-        result = qa_chain.invoke({"question":user_input})
-        response=result["answer"]
+        st.session_state.chat_history.append(("user", user_input))
+        st.session_state.chat_history.append(("assistant", response["answer"]))
 
-    else:
-        response = llm.invoke(user_input).content
-
-    st.chat_message("assistant").write(response)
-    st.session_state.chat_history.append(("user",user_input))
-    st.session_state.chat_history.append(("assistant", response))
-
-# Show past conversation
-for role, msg in st.session_state.chat_history:
-    st.chat_message(role).write(msg)
-
-
-
-
+# Display chat history
+if st.session_state.chat_history:
+    st.divider()
+    st.subheader("Chat History")
+    for role, msg in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.write(msg)
